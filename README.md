@@ -22,7 +22,8 @@ pip install -r requirements.txt
 1. **Variable de entorno:** `API_BASE_URL=http://127.0.0.1:8000`
 2. O **Streamlit secrets:** copia `.streamlit/secrets.toml.example` a `.streamlit/secrets.toml` y ajusta `API_BASE_URL`.
 
-En la barra lateral puedes sobrescribir la URL base sin reiniciar.
+El dashboard requiere login contra el backend. En producción se recomienda configurar
+`ALLOW_API_BASE_URL_OVERRIDE=false` para evitar sobrescribir la URL base desde la barra lateral.
 
 ## Ejecución
 
@@ -35,6 +36,12 @@ streamlit run streamlit_app.py
 - **Resumen:** métricas (`/api/metrics/summary`) y serie temporal (`/api/metrics/users-over-time`).
 - **Usuarios:** listado paginado con filtros (`/api/users`), detalle y mensajes (`/api/users/{id}`, `/api/users/{id}/messages`).
 - **Feed:** mensajes del tenant (`/api/tenants/{tenant_id}/messages`).
+
+## Seguridad
+
+El backend debe exponer `POST /api/auth/login` y `GET /api/auth/me`, guardar usuarios administradores con contraseña hasheada y rechazar los endpoints del dashboard sin `Authorization: Bearer <token>`.
+
+Ver detalles en [`.docs/security.md`](.docs/security.md) y mejoras sugeridas en [`.docs/app-improvements.md`](.docs/app-improvements.md).
 
 ### Tenant
 
