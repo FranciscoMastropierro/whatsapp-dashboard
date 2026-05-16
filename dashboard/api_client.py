@@ -77,6 +77,21 @@ def post_json(
         return response.json()
 
 
+def patch_json(
+    path: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    base_url: str | None = None,
+    auth_token: str | None = None,
+) -> dict[str, Any]:
+    base = resolve_base_url(base_url)
+    url = urljoin(base + "/", path.lstrip("/"))
+    with httpx.Client(timeout=30.0) as client:
+        response = client.patch(url, json=payload or {}, headers=_auth_headers(auth_token))
+        _raise_for_status(response)
+        return response.json()
+
+
 def get_json(
     path: str,
     params: dict[str, Any] | None = None,

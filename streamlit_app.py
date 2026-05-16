@@ -6,6 +6,7 @@ Run: streamlit run streamlit_app.py
 from __future__ import annotations
 
 from datetime import date
+from html import escape
 
 import httpx
 import pandas as pd
@@ -17,6 +18,7 @@ from dashboard.api_client import (
     allow_api_base_url_override,
     get_json,
     health_ok,
+    patch_json,
     post_json,
     resolve_base_url,
 )
@@ -37,6 +39,39 @@ div[data-testid="stMetric"] label {
     text-transform: uppercase;
     letter-spacing: 0.04em;
     opacity: 0.85;
+}
+.summary-card {
+    background: linear-gradient(145deg, rgba(255,255,255,0.06) 0%, rgba(255,255,255,0.02) 100%);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-left: 4px solid rgba(255,255,255,0.18);
+    border-radius: 12px;
+    padding: 0.85rem 1rem 0.75rem 1rem;
+    min-height: 118px;
+}
+.summary-card--pending {
+    background: linear-gradient(145deg, rgba(245, 158, 11, 0.13) 0%, rgba(255,255,255,0.02) 100%);
+    border-left-color: #f59e0b;
+}
+.summary-card--rejected {
+    background: linear-gradient(145deg, rgba(248, 113, 113, 0.12) 0%, rgba(255,255,255,0.02) 100%);
+    border-left-color: #f87171;
+}
+.summary-card__label {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    opacity: 0.85;
+    margin-bottom: 0.35rem;
+}
+.summary-card__value {
+    font-size: 2rem;
+    font-weight: 600;
+    line-height: 1.2;
+}
+.summary-card__description {
+    font-size: 0.82rem;
+    opacity: 0.72;
+    margin-top: 0.35rem;
 }
 /* Page title */
 .dashboard-title {
@@ -213,6 +248,24 @@ def _plotly_template() -> str:
     return "plotly_dark" if _is_dark_theme() else "plotly_white"
 
 
+def _summary_value(summary: dict, key: str, default: int = 0) -> object:
+    value = summary.get(key)
+    return default if value is None else value
+
+
+def _render_summary_card(title: str, value: object, description: str, tone: str) -> None:
+    st.markdown(
+        f"""
+        <div class="summary-card summary-card--{escape(tone)}">
+            <div class="summary-card__label">{escape(title)}</div>
+            <div class="summary-card__value">{escape(str(value))}</div>
+            <div class="summary-card__description">{escape(description)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def tab_overview(base: str, tenant_id: str | None, auth_token: str) -> None:
     st.markdown('<p class="dashboard-title">Resumen</p>', unsafe_allow_html=True)
     st.markdown(
@@ -246,6 +299,22 @@ def tab_overview(base: str, tenant_id: str | None, auth_token: str) -> None:
     ]
     for col, (label, val) in zip(r2, metrics_row2):
         col.metric(label, val)
+
+    r3 = st.columns(2)
+    with r3[0]:
+        _render_summary_card(
+            "Rechazados por zona",
+            _summary_value(summary, "qualification_rejected_location"),
+            "Usuarios rechazados por no vivir en CABA, GBA o La Plata.",
+            "rejected",
+        )
+    with r3[1]:
+        _render_summary_card(
+            "Usuarios no vistos",
+            _summary_value(summary, "users_unseen"),
+            "Usuarios pendientes de revisión en la lista.",
+            "pending",
+        )
 
     st.markdown("##### Usuarios en el tiempo")
     col_a, col_b = st.columns([1, 1])
@@ -295,11 +364,42 @@ def tab_overview(base: str, tenant_id: str | None, auth_token: str) -> None:
         st.dataframe(df, width="stretch")
 
 
-def _df_users_display(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    if "id" in out.columns:
-        out["id"] = out["id"].astype(str).str[:8] + "…"
-    return out
+def _save_seen_changes(original: pd.DataFrame, edited: pd.DataFrame, base: str, auth_token: str) -> None:
+    if "id" not in original.columns or "seen" not in original.columns or "seen" not in edited.columns:
+        return
+
+    edited = edited.copy()
+    if "id" not in edited.columns:
+        edited["id"] = original.reset_index(drop=True)["id"]
+
+    original_seen = original.set_index("id")["seen"].fillna(False).astype(bool)
+    edited_seen = edited.set_index("id")["seen"].fillna(False).astype(bool)
+    updated_count = 0
+    for user_id, seen in edited_seen.items():
+        if user_id not in original_seen.index or bool(seen) == bool(original_seen.loc[user_id]):
+            continue
+        try:
+            patch_json(f"/api/users/{user_id}", {"seen": bool(seen)}, base_url=base, auth_token=auth_token)
+        except AuthenticationError:
+            raise
+        except (httpx.HTTPError, ValueError) as e:
+            st.error(f"No se pudo actualizar visto para el usuario {str(user_id)[:8]}…: {e}")
+            return
+        updated_count += 1
+
+    if updated_count:
+        st.toast("Estado visto actualizado.")
+        st.rerun()
+
+
+def _style_seen_user_row(row: pd.Series) -> list[str]:
+    if not bool(row.get("seen", False)):
+        return [""] * len(row)
+
+    styles = ["background-color: rgba(34, 197, 94, 0.08)"] * len(row)
+    if styles:
+        styles[0] += "; border-left: 4px solid #22c55e"
+    return styles
 
 
 def tab_users(base: str, tenant_id: str | None, auth_token: str) -> None:
@@ -355,30 +455,41 @@ def tab_users(base: str, tenant_id: str | None, auth_token: str) -> None:
             "name",
             "whatsapp_number",
             "message_count",
+            "seen",
             "qualification_completed",
             "qualification_passed",
             "created_at",
+            "last_message_at",
             "id",
         ]
         if c in df.columns
     ]
-    show = _df_users_display(df[display_cols])
+    show = df[display_cols].copy()
+    if "seen" in show.columns:
+        show["seen"] = show["seen"].fillna(False).astype(bool)
     if "created_at" in show.columns:
         show["created_at"] = pd.to_datetime(show["created_at"], utc=True, errors="coerce")
-    st.dataframe(
-        show,
+    if "last_message_at" in show.columns:
+        show["last_message_at"] = pd.to_datetime(show["last_message_at"], utc=True, errors="coerce")
+    edited_show = st.data_editor(
+        show.style.apply(_style_seen_user_row, axis=1),
         width="stretch",
         hide_index=True,
+        disabled=[column for column in show.columns if column != "seen"],
+        key=f"users_editor_{tenant_id or 'all'}_{page}_{qual}_{created_since or 'all'}",
         column_config={
             "name": st.column_config.TextColumn("Nombre", width="small"),
             "whatsapp_number": st.column_config.TextColumn("WhatsApp", width="medium"),
             "message_count": st.column_config.NumberColumn("Msgs", width="small"),
+            "seen": st.column_config.CheckboxColumn("Visto", width="small"),
             "qualification_completed": st.column_config.CheckboxColumn("Calif. hecha"),
             "qualification_passed": st.column_config.CheckboxColumn("Aprobado"),
             "created_at": st.column_config.DatetimeColumn("Alta", format="dd/MM/yyyy HH:mm"),
-            "id": st.column_config.TextColumn("ID", width="small"),
+            "last_message_at": st.column_config.DatetimeColumn("Últ. mensaje", format="HH:mm", width="small"),
+            "id": None,
         },
     )
+    _save_seen_changes(show, edited_show, base, auth_token)
 
     user_options = {f"{r.get('name', '')} (`{str(r.get('id', ''))[:8]}…`)": str(r["id"]) for r in items if r.get("id")}
     if not user_options:
