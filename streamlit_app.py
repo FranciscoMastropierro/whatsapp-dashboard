@@ -5,6 +5,7 @@ Run: streamlit run streamlit_app.py
 
 from __future__ import annotations
 
+import time
 from datetime import date
 from html import escape
 
@@ -544,90 +545,181 @@ def tab_users(base: str, tenant_id: str | None, auth_token: str) -> None:
     )
 
 
-def _prepare_feed_dataframe(items: list[dict]) -> pd.DataFrame:
-    df = pd.DataFrame(items)
-    if df.empty:
-        return df
-    for col in ("id", "user_id"):
-        if col in df.columns:
-            df[col] = df[col].astype(str).str[:8] + "…"
-    preferred = [
-        "created_at",
-        "user_name",
-        "user_whatsapp",
-        "role",
-        "content",
-        "user_id",
-        "id",
-    ]
-    cols = [c for c in preferred if c in df.columns]
-    rest = [c for c in df.columns if c not in cols]
-    return df[cols + rest]
+def _format_whatsapp(number: str | None) -> str:
+    if not number:
+        return ""
+    s = str(number)
+    if s.startswith("whatsapp:"):
+        return s[len("whatsapp:") :]
+    return s
+
+
+def _user_search_label(user: dict) -> str:
+    name = user.get("name") or "(sin nombre)"
+    wa = _format_whatsapp(user.get("whatsapp_number"))
+    parts = [name, wa]
+    last = user.get("last_message_at")
+    if last:
+        try:
+            dt = pd.to_datetime(last, utc=True)
+            parts.append(f"últ. mensaje {dt.strftime('%d/%m %H:%M')}")
+        except (ValueError, TypeError):
+            pass
+    return " · ".join(part for part in parts if part)
+
+
+def _debounced_text_input(
+    label: str,
+    key: str,
+    *,
+    min_chars: int = 2,
+    debounce_s: float = 0.3,
+) -> str | None:
+    raw_key = f"{key}_raw"
+    ts_key = f"{key}_ts"
+
+    query = st.text_input(label, key=key).strip()
+
+    prev_raw = st.session_state.get(raw_key, "")
+    if query != prev_raw:
+        st.session_state[raw_key] = query
+        st.session_state[ts_key] = time.time()
+
+    if len(query) < min_chars:
+        return None
+
+    last_ts = st.session_state.get(ts_key, 0.0)
+    elapsed = time.time() - last_ts
+    if elapsed < debounce_s:
+        time.sleep(debounce_s - elapsed)
+        st.rerun()
+
+    return query
 
 
 def tab_tenant_feed(base: str, tenant_id: str | None, auth_token: str) -> None:
+    _ = tenant_id
+
     st.markdown('<p class="dashboard-title">Feed de mensajes</p>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="dashboard-sub">Historial del tenant (todos los usuarios).</p>',
+        '<p class="dashboard-sub">Buscá un usuario por nombre o WhatsApp para ver su conversación.</p>',
         unsafe_allow_html=True,
     )
-    if not tenant_id:
-        st.warning("No hay tenant resuelto. Revisa el API `/api/tenants`.")
+
+    query = _debounced_text_input("Buscar por nombre o WhatsApp", key="tf_search")
+    if not query:
+        st.info("Ingresá al menos 2 caracteres para buscar.")
         return
 
-    f1, f2, f3 = st.columns(3)
-    with f1:
-        role = st.selectbox("Rol", ["(todos)", "user", "assistant", "system", "tool"], key="tf_role")
-    with f2:
-        page = st.number_input("Página", min_value=1, value=1, key="tf_page")
-    with f3:
-        limit = st.number_input("Por página", min_value=1, max_value=100, value=50, key="tf_limit")
-
-    user_filter = st.text_input("Filtrar por user_id (UUID completo)", "", key="tf_uid").strip()
-    use_since = st.checkbox("Solo desde fecha", key="tf_use_since")
-    created_since = None
-    if use_since:
-        d = st.date_input("Desde", value=date.today().replace(day=1), key="tf_since")
-        created_since = d.isoformat()
-
-    params: dict = {"page": int(page), "limit": int(limit)}
-    if role != "(todos)":
-        params["role"] = role
-    if user_filter:
-        params["user_id"] = user_filter
-    if created_since:
-        params["created_since"] = created_since
-
     try:
-        data = get_json(f"/api/tenants/{tenant_id}/messages", params, base_url=base, auth_token=auth_token)
+        data = get_json(
+            "/api/users",
+            {"search": query, "page": 1, "limit": 20},
+            base_url=base,
+            auth_token=auth_token,
+        )
     except AuthenticationError:
         raise
     except (httpx.HTTPError, ValueError) as e:
-        st.error(f"Error al cargar mensajes: {e}")
+        st.error(f"Error al buscar usuarios: {e}")
         return
 
     items = data.get("items") or []
     total = data.get("total", 0)
-    st.caption(f"**{total}** mensajes en total (esta vista: página **{data.get('page', page)}**)")
-
     if not items:
-        st.info("Sin resultados.")
+        st.info("Sin usuarios que coincidan.")
         return
-    df = _prepare_feed_dataframe(items)
-    if "created_at" in df.columns:
-        df["created_at"] = pd.to_datetime(df["created_at"], utc=True, errors="coerce")
+
+    st.caption(f"**{total}** usuario(s) encontrado(s)")
+
+    display_df = pd.DataFrame(items)
+    show_cols = [
+        column
+        for column in ["name", "whatsapp_number", "last_message_at", "message_count"]
+        if column in display_df.columns
+    ]
+    if show_cols:
+        show = display_df[show_cols].copy()
+        if "whatsapp_number" in show.columns:
+            show["whatsapp_number"] = show["whatsapp_number"].apply(_format_whatsapp)
+        if "last_message_at" in show.columns:
+            show["last_message_at"] = pd.to_datetime(show["last_message_at"], utc=True, errors="coerce")
+        st.dataframe(
+            show,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "name": st.column_config.TextColumn("Nombre", width="small"),
+                "whatsapp_number": st.column_config.TextColumn("WhatsApp", width="medium"),
+                "last_message_at": st.column_config.DatetimeColumn("Últ. mensaje", format="dd/MM/yyyy HH:mm"),
+                "message_count": st.column_config.NumberColumn("Msgs", width="small"),
+            },
+        )
+
+    user_options: dict[str, str] = {}
+    for index, row in enumerate(items):
+        if not row.get("id"):
+            continue
+        label = _user_search_label(row)
+        if label in user_options:
+            label = f"{label} (#{index + 1})"
+        user_options[label] = str(row["id"])
+    if not user_options:
+        return
+
+    labels = list(user_options.keys())
+    default_idx = 0
+    prev_uid = st.session_state.get("tf_selected_user_id")
+    if prev_uid and prev_uid in user_options.values():
+        default_idx = list(user_options.values()).index(prev_uid)
+
+    choice = st.selectbox("Seleccionar conversación", labels, index=default_idx, key="tf_user_choice")
+    uid = user_options[choice]
+    st.session_state["tf_selected_user_id"] = uid
+
+    selected = next((row for row in items if str(row.get("id")) == uid), {})
+    st.markdown(
+        f"**{selected.get('name') or '(sin nombre)'}** · {_format_whatsapp(selected.get('whatsapp_number'))}"
+    )
+
+    st.divider()
+    st.subheader("Mensajes")
+    msg_page = st.number_input("Página mensajes", min_value=1, value=1, key="tf_msg_page")
+    try:
+        msgs = get_json(
+            f"/api/users/{uid}/messages",
+            {"page": int(msg_page), "limit": 50},
+            base_url=base,
+            auth_token=auth_token,
+        )
+    except AuthenticationError:
+        raise
+    except (httpx.HTTPError, ValueError) as e:
+        st.error(f"No se pudieron cargar mensajes: {e}")
+        return
+
+    mitems = msgs.get("items") or []
+    msg_total = msgs.get("total", 0)
+    st.caption(f"**{msg_total}** mensajes en total (página **{msgs.get('page', msg_page)}**)")
+
+    if not mitems:
+        st.info("Sin mensajes en esta página.")
+        return
+
+    mdf = pd.DataFrame(mitems)
+    display_msg_cols = [column for column in ["role", "content", "created_at"] if column in mdf.columns]
+    mdf = mdf[display_msg_cols] if display_msg_cols else mdf
+    if "created_at" in mdf.columns:
+        mdf = mdf.sort_values("created_at")
+        mdf["created_at"] = pd.to_datetime(mdf["created_at"], utc=True, errors="coerce")
     st.dataframe(
-        df,
+        mdf,
         width="stretch",
         hide_index=True,
         column_config={
-            "created_at": st.column_config.DatetimeColumn("Fecha", format="dd/MM/yyyy HH:mm", width="small"),
-            "user_name": st.column_config.TextColumn("Usuario", width="small"),
-            "user_whatsapp": st.column_config.TextColumn("WhatsApp", width="medium"),
             "role": st.column_config.TextColumn("Rol", width="small"),
             "content": st.column_config.TextColumn("Mensaje", width="large"),
-            "user_id": st.column_config.TextColumn("User id", width="small"),
-            "id": st.column_config.TextColumn("Msg id", width="small"),
+            "created_at": st.column_config.DatetimeColumn("Fecha", format="dd/MM/yyyy HH:mm"),
         },
     )
 
